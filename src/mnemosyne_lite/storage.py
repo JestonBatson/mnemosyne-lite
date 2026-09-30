@@ -1,21 +1,21 @@
-"""PostgreSQL persistence; domain rules remain in :mod:`mnemosyne_lite.service`."""
+"""PostgreSQL repository for the validated Mnemosyne Lite domain model."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from collections.abc import Callable
 from datetime import UTC, datetime
 from hashlib import sha256
 from uuid import UUID, uuid4
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, Text, create_engine, select
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.dialects.postgresql import ENUM as PG_ENUM, UUID as PG_UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from .models import EvidenceCreate, MemoryCreate, MemoryStatus, RevisionCreate
-from .service import DomainError, LIFECYCLE_TRANSITIONS
+from .service import ACTIVE, DomainError, LIFECYCLE_TRANSITIONS
 
 
-class Base(DeclarativeBase): pass
+class Base(DeclarativeBase):
+    """ORM metadata retained for query mapping; migrations own the schema."""
 
 
 class EvidenceRow(Base):
@@ -36,7 +36,7 @@ class MemoryRow(Base):
     subject: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     predicate: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[MemoryStatus] = mapped_column(PG_ENUM(MemoryStatus, name="memory_status", create_type=False), nullable=False)
     confidence: Mapped[float] = mapped_column(nullable=False)
     supersedes_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("memories.id"))
     superseded_by_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("memories.id"), unique=True)
@@ -52,42 +52,91 @@ class ProvenanceRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
 
 
+class RevisionRow(Base):
+    __tablename__ = "revisions"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    old_memory_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("memories.id", ondelete="RESTRICT"), nullable=False)
+    new_memory_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("memories.id", ondelete="RESTRICT"), nullable=False, unique=True)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
+
+
 class PostgresMemoryRepository:
-    def __init__(self, database_url: str):
+    def __init__(self, database_url: str, revision_failpoint: Callable[[], None] | None = None):
         self.engine = create_engine(database_url)
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
-
-    def create_schema(self) -> None: Base.metadata.create_all(self.engine)
+        self._revision_failpoint = revision_failpoint
 
     def add_evidence(self, request: EvidenceCreate) -> EvidenceRow:
         digest = sha256(request.content.encode()).hexdigest()
         with self.sessions.begin() as session:
             existing = session.scalar(select(EvidenceRow).where(EvidenceRow.content_hash == digest))
-            if existing: return existing
+            if existing:
+                return existing
             row = EvidenceRow(content_hash=digest, source_type=request.source_type, source_reference=request.source_reference, content=request.content)
-            session.add(row); session.flush()
+            session.add(row)
+            session.flush()
             return row
 
     def create_memory(self, request: MemoryCreate) -> MemoryRow:
+        if request.status not in ACTIVE:
+            raise DomainError("new memories must be active")
         with self.sessions.begin() as session:
             self._require_evidence(session, request.evidence_ids)
-            if request.status not in {MemoryStatus.OBSERVED, MemoryStatus.INFERRED, MemoryStatus.VERIFIED}: raise DomainError("new memories must be active")
-            row = MemoryRow(lineage_id=uuid4(), subject=request.subject, predicate=request.predicate, value=request.value, status=request.status.value, confidence=request.confidence)
-            session.add(row); session.flush(); self._attach(session, row.id, request.evidence_ids); return row
+            row = MemoryRow(lineage_id=uuid4(), subject=request.subject, predicate=request.predicate, value=request.value, status=request.status, confidence=request.confidence)
+            session.add(row)
+            session.flush()
+            self._attach(session, row.id, request.evidence_ids)
+            return row
 
     def revise(self, memory_id: UUID, request: RevisionCreate) -> MemoryRow:
+        if request.status not in ACTIVE:
+            raise DomainError("a revision must create an active memory")
         with self.sessions.begin() as session:
             old = session.scalar(select(MemoryRow).where(MemoryRow.id == memory_id).with_for_update())
-            if not old or "revise" not in LIFECYCLE_TRANSITIONS[MemoryStatus(old.status)]: raise DomainError("memory is not revisable")
+            if not old or "revise" not in LIFECYCLE_TRANSITIONS[old.status]:
+                raise DomainError("memory is not revisable")
             self._require_evidence(session, request.evidence_ids)
-            row = MemoryRow(lineage_id=old.lineage_id, subject=old.subject, predicate=old.predicate, value=request.value, status=request.status.value, confidence=request.confidence, supersedes_id=old.id)
-            session.add(row); session.flush(); self._attach(session, row.id, request.evidence_ids)
-            old.status = MemoryStatus.SUPERSEDED.value; old.superseded_by_id = row.id
+            row = MemoryRow(lineage_id=old.lineage_id, subject=old.subject, predicate=old.predicate, value=request.value, status=request.status, confidence=request.confidence, supersedes_id=old.id)
+            session.add(row)
+            session.flush()
+            self._attach(session, row.id, request.evidence_ids)
+            session.add(RevisionRow(old_memory_id=old.id, new_memory_id=row.id, reason=request.reason))
+            if self._revision_failpoint:
+                self._revision_failpoint()
+            old.status = MemoryStatus.SUPERSEDED
+            old.superseded_by_id = row.id
             return row
+
+    def retract(self, memory_id: UUID) -> MemoryRow:
+        with self.sessions.begin() as session:
+            row = session.scalar(select(MemoryRow).where(MemoryRow.id == memory_id).with_for_update())
+            if not row or "retract" not in LIFECYCLE_TRANSITIONS[row.status]:
+                raise DomainError("memory is not retractable")
+            row.status = MemoryStatus.RETRACTED
+            row.retracted_at = datetime.now(UTC)
+            return row
+
+    def current(self, subject: str, predicate: str) -> list[MemoryRow]:
+        with self.sessions() as session:
+            return list(session.scalars(select(MemoryRow).where(MemoryRow.subject == subject, MemoryRow.predicate == predicate, MemoryRow.status.in_(ACTIVE)).order_by(MemoryRow.created_at, MemoryRow.id)))
+
+    def history(self, memory_id: UUID) -> list[MemoryRow]:
+        with self.sessions() as session:
+            memory = session.get(MemoryRow, memory_id)
+            if not memory:
+                raise DomainError("memory not found")
+            return list(session.scalars(select(MemoryRow).where(MemoryRow.lineage_id == memory.lineage_id).order_by(MemoryRow.created_at, MemoryRow.id)))
+
+    def provenance_for(self, memory_id: UUID) -> list[UUID]:
+        with self.sessions() as session:
+            return list(session.scalars(select(ProvenanceRow.evidence_id).where(ProvenanceRow.memory_id == memory_id).order_by(ProvenanceRow.evidence_id)))
 
     @staticmethod
     def _require_evidence(session: Session, ids: list[UUID]) -> None:
-        if len(ids) != len(set(ids)) or session.query(EvidenceRow).filter(EvidenceRow.id.in_(ids)).count() != len(ids): raise DomainError("every operation requires existing, distinct evidence")
+        if len(ids) != len(set(ids)) or session.query(EvidenceRow).filter(EvidenceRow.id.in_(ids)).count() != len(ids):
+            raise DomainError("every operation requires existing, distinct evidence")
+
     @staticmethod
     def _attach(session: Session, memory_id: UUID, ids: list[UUID]) -> None:
         session.add_all(ProvenanceRow(memory_id=memory_id, evidence_id=item) for item in ids)

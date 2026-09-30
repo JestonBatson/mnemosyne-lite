@@ -26,5 +26,7 @@ prior memory.
 
 `python -m pip install '.[dev]' && python -m pytest`
 
-The implementation and operational documentation are being completed before
-this repository is initialized or published.
+The domain suite runs without infrastructure. PostgreSQL integration tests run
+only when `DATABASE_URL` is set; CI provisions PostgreSQL 16, applies the SQL
+migrations to an empty database, and then runs both suites. Schema changes are
+migration-owned; the repository does not create tables at runtime.
