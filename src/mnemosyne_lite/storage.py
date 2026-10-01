@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import ENUM as PG_ENUM, UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from .models import EvidenceCreate, MemoryCreate, MemoryStatus, RevisionCreate
-from .service import ACTIVE, DomainError, LIFECYCLE_TRANSITIONS
+from .service import ACTIVE, ConflictError, DomainError, LIFECYCLE_TRANSITIONS, NotFoundError
 
 
 class Base(DeclarativeBase):
@@ -94,8 +94,10 @@ class PostgresMemoryRepository:
             raise DomainError("a revision must create an active memory")
         with self.sessions.begin() as session:
             old = session.scalar(select(MemoryRow).where(MemoryRow.id == memory_id).with_for_update())
-            if not old or "revise" not in LIFECYCLE_TRANSITIONS[old.status]:
-                raise DomainError("memory is not revisable")
+            if not old:
+                raise NotFoundError("memory not found")
+            if "revise" not in LIFECYCLE_TRANSITIONS[old.status]:
+                raise ConflictError("memory is not revisable")
             self._require_evidence(session, request.evidence_ids)
             row = MemoryRow(lineage_id=old.lineage_id, subject=old.subject, predicate=old.predicate, value=request.value, status=request.status, confidence=request.confidence, supersedes_id=old.id)
             session.add(row)
@@ -111,8 +113,10 @@ class PostgresMemoryRepository:
     def retract(self, memory_id: UUID) -> MemoryRow:
         with self.sessions.begin() as session:
             row = session.scalar(select(MemoryRow).where(MemoryRow.id == memory_id).with_for_update())
-            if not row or "retract" not in LIFECYCLE_TRANSITIONS[row.status]:
-                raise DomainError("memory is not retractable")
+            if not row:
+                raise NotFoundError("memory not found")
+            if "retract" not in LIFECYCLE_TRANSITIONS[row.status]:
+                raise ConflictError("memory is not retractable")
             row.status = MemoryStatus.RETRACTED
             row.retracted_at = datetime.now(UTC)
             return row
@@ -125,18 +129,36 @@ class PostgresMemoryRepository:
         with self.sessions() as session:
             memory = session.get(MemoryRow, memory_id)
             if not memory:
-                raise DomainError("memory not found")
+                raise NotFoundError("memory not found")
             return list(session.scalars(select(MemoryRow).where(MemoryRow.lineage_id == memory.lineage_id).order_by(MemoryRow.created_at, MemoryRow.id)))
 
     def provenance_for(self, memory_id: UUID) -> list[UUID]:
         with self.sessions() as session:
             return list(session.scalars(select(ProvenanceRow.evidence_id).where(ProvenanceRow.memory_id == memory_id).order_by(ProvenanceRow.evidence_id)))
 
+    def get_memory(self, memory_id: UUID) -> MemoryRow:
+        with self.sessions() as session:
+            row = session.get(MemoryRow, memory_id)
+            if row is None:
+                raise NotFoundError("memory not found")
+            return row
+
+    def revision_for(self, memory_id: UUID) -> RevisionRow | None:
+        with self.sessions() as session:
+            return session.scalar(select(RevisionRow).where(RevisionRow.new_memory_id == memory_id))
+
+    def ready(self) -> None:
+        with self.engine.connect() as connection:
+            from sqlalchemy import text
+            connection.execute(text("SELECT 1"))
+
     @staticmethod
     def _require_evidence(session: Session, ids: list[UUID]) -> None:
-        if len(ids) != len(set(ids)) or session.query(EvidenceRow).filter(EvidenceRow.id.in_(ids)).count() != len(ids):
-            raise DomainError("every operation requires existing, distinct evidence")
+        if not ids:
+            raise DomainError("provenance is required")
+        if session.query(EvidenceRow).filter(EvidenceRow.id.in_(set(ids))).count() != len(set(ids)):
+            raise NotFoundError("evidence not found")
 
     @staticmethod
     def _attach(session: Session, memory_id: UUID, ids: list[UUID]) -> None:
-        session.add_all(ProvenanceRow(memory_id=memory_id, evidence_id=item) for item in ids)
+        session.add_all(ProvenanceRow(memory_id=memory_id, evidence_id=item) for item in set(ids))

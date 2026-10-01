@@ -32,5 +32,5 @@ jobs:
         run: python -m pip install --upgrade pip && python -m pip install '.[dev]'
       - name: Apply migrations to empty PostgreSQL database
         run: python scripts/migrate.py
-      - name: Run domain and PostgreSQL integration tests
+      - name: Run domain, HTTP contract, and real PostgreSQL end-to-end tests
         run: python -m pytest -q

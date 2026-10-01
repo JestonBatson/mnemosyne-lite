@@ -12,6 +12,14 @@ class DomainError(ValueError):
     """Raised when an operation would violate the memory lifecycle."""
 
 
+class NotFoundError(DomainError):
+    """A requested memory or evidence record does not exist."""
+
+
+class ConflictError(DomainError):
+    """The requested operation conflicts with the record lifecycle."""
+
+
 ACTIVE = {MemoryStatus.OBSERVED, MemoryStatus.INFERRED, MemoryStatus.VERIFIED}
 LIFECYCLE_TRANSITIONS = {
     MemoryStatus.OBSERVED: {"revise", "retract"},
