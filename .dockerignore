@@ -1,0 +1,11 @@
+*
+!Dockerfile
+!pyproject.toml
+!README.md
+!src/
+!src/mnemosyne_lite/
+!src/mnemosyne_lite/*.py
+!migrations/
+!migrations/*.sql
+!scripts/
+!scripts/migrate.py

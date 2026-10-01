@@ -33,6 +33,34 @@ migration-owned; the repository does not create tables at runtime.
 
 ## HTTP API
 
+### Run with Docker Compose
+
+Copy `.env.example` to `.env`, replace the development password and the matching
+password in `DATABASE_URL`, then run:
+
+```sh
+docker compose up --build -d --wait
+```
+
+Open `http://localhost:8000/docs`. Compose waits for PostgreSQL 16 to become
+healthy, runs the explicit one-shot `migrate` service, then starts the API.
+The API runs as a non-root user; its container healthcheck calls `/ready`.
+PostgreSQL data lives in a named volume and survives API restarts.
+The API port binds to localhost and PostgreSQL has no published host port.
+The image build context includes only runtime source, migration files, and
+package metadata; `.env`, tests, Git history, and local artifacts are excluded.
+
+`docker compose down` stops the stack and preserves its data volume.
+`docker compose down --volumes` additionally deletes the development database.
+
+CI builds and boots a fresh Compose stack, runs the canonical flow through real
+HTTP, checks the terminal-state `409`, restarts the API, verifies preserved
+current state, lineage, provenance, and history, and removes the test volume.
+Docker is unavailable on the author's current local machine; the Compose
+checkpoint is verified independently in GitHub Actions.
+
+### Run directly with Python
+
 Set `DATABASE_URL` to your PostgreSQL connection URL, then run:
 
 ```sh
