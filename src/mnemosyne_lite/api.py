@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_app(repository: Repository) -> FastAPI:
-    app = FastAPI(title="Mnemosyne Lite", version="0.1.0", description="Evidence-backed, versioned memory with explicit lineage. Authentication and tenant isolation are outside v1 scope.")
+    app = FastAPI(title="Mnemosyne Lite", version="1.0.0", description="Evidence-backed, versioned memory with explicit lineage. Authentication and tenant isolation are outside v1 scope.")
     service = MemoryApplication(repository)
 
     @app.exception_handler(DomainError)
