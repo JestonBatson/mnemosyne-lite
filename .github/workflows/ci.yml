@@ -53,18 +53,16 @@ jobs:
           echo "DATABASE_URL=postgresql+psycopg://mnemosyne:$password@postgres:5432/mnemosyne" >> "$GITHUB_ENV"
       - name: Build runtime images
         run: docker compose build
+      - name: Inspect image artifacts and non-root runtime
+        run: docker run --rm -i --entrypoint python mnemosyne-ci-api - < scripts/verify_image.py
       - name: Boot fresh stack and wait for API readiness
         run: docker compose up -d --wait --wait-timeout 120
       - name: Verify explicit migration succeeded
         run: |
           docker compose logs migrate
           docker compose exec -T postgres psql -U mnemosyne -d mnemosyne -tAc "SELECT version FROM schema_migrations" | grep -Fx '001_initial.sql'
-      - name: Smoke test canonical HTTP flow and terminal-state conflict
-        run: python scripts/smoke_http.py seed --base-url http://127.0.0.1:18000 --state "$RUNNER_TEMP/mnemosyne-smoke.json"
-      - name: Restart API container
-        run: docker compose restart api
-      - name: Verify persistence after API restart
-        run: python scripts/smoke_http.py verify --base-url http://127.0.0.1:18000 --state "$RUNNER_TEMP/mnemosyne-smoke.json"
+      - name: Canonical demo, terminal conflict, and restart persistence
+        run: python scripts/demo.py --base-url http://127.0.0.1:18000
       - name: Report stack logs on failure
         if: failure()
         run: docker compose logs --no-color

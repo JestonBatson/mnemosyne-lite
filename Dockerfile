@@ -8,6 +8,7 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN python -m pip install . \
+    && rm -rf /app/build /app/src \
     && useradd --create-home --uid 10001 appuser
 
 COPY migrations ./migrations
